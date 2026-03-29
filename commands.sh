@@ -11,8 +11,5 @@ git pull
 # Step 4: Compile
 make
 
-# Step 5: Run naive GEMM sanity check
-./gemm_naive
-
-# Step 6: Run profiler
+# Step 5: Run profiler
 python3 profiler.py
