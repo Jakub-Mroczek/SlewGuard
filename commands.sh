@@ -8,8 +8,11 @@ module load cuda
 cd ~/ece695_hml-p1
 git pull
 
-# Step 4: Compile
+# Step 4: Install Python dependencies
+pip install -r requirements.txt
+
+# Step 5: Compile
 make
 
-# Step 5: Run profiler
+# Step 6: Run profiler
 python3 profiler.py
