@@ -1,0 +1,47 @@
+
+# High level operation:
+
+The V-min can be set by user. 
+For every kernel run, the controller calculates the V-safe which is a function of V_load(M_min), V_load(M_max), V_min. 
+Then the V_shrink = V-safe - deadband (hysteresis). The batch size is throttled only when v_load crosses V_shrink. 
+No throttling between V_shrink and V-safe.
+
+Phases of Slew Guard:
+Phase 1: NVML Calibration (controller training)
+For the given kernel, the power boundaries for M_min and M_max is recorded and post-processed using the PDN parameters to learn the DC
+voltage boundaries, V_shrink, V_safe, etc.
+
+Phase 2: Ramp up the kernels to full performance as a warm-up to reach steady-state performance.
+
+Phase 3: Controller starts reacting
+
+Each controller tick is one full decision step: the kernel worker has just reported a new NVML power sample, the PDN model advances one step 
+and produces a fresh V_load, and the controller compares that V_load against V_shrink to pick exactly one action — shrink, grow, or hold. 
+The tick therefore sets how responsive the loop can be to fast droops.
+
+Tick: PDN decision loop latency (to nvml reporting + loop feedback)
+Shrink: Batch size throttles down
+Grow: Batch size steps up to recover performance (FLOPS) after v_load > v_shrink
+
+shrink_period: 
+Minimum wall time between consecutive shrinks. 
+Even if V_load sits below V_shrink for many ticks, only one shrink fires per shrink_period. 
+So the controller doesn’t over‑throttle on a droop the previous shrink has already started to correct. 
+It also models realistic driver‑layer throttle latency. 
+
+grow_period: 
+Minimum wall time between consecutive grows. 
+Each grow causes a small positive di/dt and therefore a small V_ac undershoot on the PDN. 
+Multiple grows can again cause v_load to violate v_shrink (which is what we don't want to happen lol)
+
+Every tick evaluates the droop, but a shrink can issue at most once per shrink_period and a grow at most once per grow_period.
+
+
+# Run controller without throttle
+python3 controller.py --kernel tiled_gemm --V-min 0.930 --total-seconds 5 --deadband-mv 5 --no-throttle
+
+# Run the controller with throttling enabled by default
+python3 controller.py --kernel tiled_gemm --V-min 0.930 --total-seconds 5 --deadband-mv 5
+
+# To check all available args:
+python3 controller.py --help
