@@ -1,2 +1,4 @@
 nvidia-ml-py
 numpy
+torch
+torchvision

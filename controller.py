@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import ctypes
+import os
 import random
 import threading
 import time
@@ -104,11 +105,14 @@ def _phase_stats(
 
 
 def _calibrate_pdn_from_nvml(
+    run_fn,
+    M_min: int,
+    M_max: int,
     warmup_s: float = _CALIB_WARMUP_S,
     sample_s: float = _CALIB_SAMPLE_S,
     poll_s: float = _CALIB_POLL_S,
 ) -> dict:
-    # Measure P_idle, P_full and σ(M_MIN), σ(M_MAX) via NVML.
+    # Measure P_idle, P_full and σ(M_min), σ(M_max) via NVML.
 
     readings: list = []
     stop_ev = threading.Event()
@@ -117,8 +121,7 @@ def _calibrate_pdn_from_nvml(
     )
     poller.start()
 
-    ms = ctypes.c_float(0.0)
-    phase_samples: dict[int, list[tuple[float, float]]] = {_M_MIN: [], _M_MAX: []}
+    phase_samples: dict[int, list[tuple[float, float]]] = {M_min: [], M_max: []}
     used_buffer = True
 
     def _run_phase(M: int) -> tuple[float, float]:
@@ -126,13 +129,13 @@ def _calibrate_pdn_from_nvml(
         _, last_ts = fetch_nvml_power_samples(0)
         t0 = time.time()
         while time.time() < t0 + warmup_s:
-            if lib.gemm_run(ctypes.c_int(M), ctypes.byref(ms)) != 0:
+            if run_fn(M)[0] != 0:
                 break
         _, last_ts = fetch_nvml_power_samples(last_ts)
         t_smp_s = time.time()
         t_end   = t_smp_s + sample_s
         while time.time() < t_end:
-            if lib.gemm_run(ctypes.c_int(M), ctypes.byref(ms)) != 0:
+            if run_fn(M)[0] != 0:
                 break
         buf_samples, _ = fetch_nvml_power_samples(last_ts)
         if buf_samples:
@@ -146,14 +149,14 @@ def _calibrate_pdn_from_nvml(
         return t_smp_s, t_end
 
     try:
-        _run_phase(_M_MIN)
-        _run_phase(_M_MAX)
+        _run_phase(M_min)
+        _run_phase(M_max)
     finally:
         stop_ev.set()
         poller.join()
 
-    P_idle, P_idle_std, n_idle = _phase_stats(phase_samples[_M_MIN])
-    P_full, P_full_std, n_full = _phase_stats(phase_samples[_M_MAX])
+    P_idle, P_idle_std, n_idle = _phase_stats(phase_samples[M_min])
+    P_full, P_full_std, n_full = _phase_stats(phase_samples[M_max])
     return {
         "P_idle": P_idle,
         "P_full": P_full,
@@ -226,6 +229,8 @@ class HysteresisController:
     grow_step: int   = _GROW_STEP_DEFAULT
     shrink_step: int   = _SHRINK_STEP_DEFAULT
     M: int = _M_INIT
+    M_min: int = _M_MIN
+    M_max: int = _M_MAX
     throttle_enabled: bool  = True
     _last_shrink_t: float = field(default=-1.0, repr=False)
     _last_grow_t: float = field(default=-1.0, repr=False)
@@ -241,14 +246,14 @@ class HysteresisController:
         if V_load < self.V_shrink_trigger:
             if (t_now - self._last_shrink_t) >= self.shrink_period_s:
                 self._last_shrink_t = t_now
-                self.M = max(_M_MIN, self.M - self.shrink_step)
+                self.M = max(self.M_min, self.M - self.shrink_step)
                 self._last_grow_t = t_now + self.shrink_period_s
                 return self.M, "shrink"
             return self.M, "hold"
 
-        if self.M < _M_MAX and (t_now - self._last_grow_t) >= self.grow_period_s:
+        if self.M < self.M_max and (t_now - self._last_grow_t) >= self.grow_period_s:
             self._last_grow_t = t_now
-            self.M = min(_M_MAX, self.M + self.grow_step)
+            self.M = min(self.M_max, self.M + self.grow_step)
             return self.M, "grow"
         return self.M, "hold"
 
@@ -287,18 +292,23 @@ class WorkerState:
     lock: threading.Lock   = field(default_factory=threading.Lock)
 
 
-def _kernel_worker(state: WorkerState, stop: threading.Event) -> None:
-    """Continuously launch the active GEMM at state.M_current.  The
-    cudaEventSynchronize inside gemm_run releases the GIL so the
-    controller thread runs in parallel with the GPU."""
-    ms = ctypes.c_float(0.0)
+def _kernel_worker(
+    state: WorkerState,
+    stop: threading.Event,
+    run_fn,
+    flops_fn,
+    M_min: int,
+) -> None:
+    """Continuously launch the workload at state.M_current.  The GPU sync
+    inside run_fn releases the GIL so the controller thread runs in parallel."""
     while not stop.is_set():
-        M = max(_M_MIN, state.M_current)
-        if lib.gemm_run(ctypes.c_int(M), ctypes.byref(ms)) != 0:
+        M = max(M_min, state.M_current)
+        rc, elapsed_ms = run_fn(M)
+        if rc != 0:
             break
         with state.lock:
-            state.total_flops     += 2.0 * M * _N * _N
-            state.total_kernel_ms += float(ms.value)
+            state.total_flops     += flops_fn(M)
+            state.total_kernel_ms += elapsed_ms
             state.n_launches      += 1
 
 
@@ -330,6 +340,9 @@ def run_live(
     ramp_up_s: float           = _DEFAULT_RAMP_UP_S,
     deadband_mv: float         = _V_SAFE_HYSTERESIS_MV,
     pdn_noise_scale: float     = _DEFAULT_PDN_NOISE_SCALE,
+    workload: str              = "gemm",
+    M_min: int                 = _M_MIN,
+    M_max: int                 = _M_MAX,
 ) -> tuple:
     """
     Run the closed-loop SlewGuard controller on the live GPU.
@@ -352,35 +365,57 @@ def run_live(
 
     pdn = PDN(R=R, L=L, C=C, V_min=V_min, _TAU_ENV=_TAU_ENV_S)
 
-    # Kernel init must happen BEFORE calibration so the calibration phase
-    # can launch the selected kernel to measure real NVML power.
-    select_kernel(kernel_name)
-
-    A = np.ones((_N, _N), dtype=np.float32)
-    B = np.ones((_N, _N), dtype=np.float32)
-    if lib.gemm_init(_N, _N, _N) != 0:
-        raise RuntimeError("gemm_init failed")
-
     timeline:        List[Tick]  = []
     events:          List[Event] = []
     nvml_rdg:        list        = []
     stop_ev          = threading.Event()
     poller = kernel_thr = None
 
-    try:
-        b_ptr = B.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        a_ptr = A.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        if lib.gemm_upload_B(b_ptr) != 0:
-            raise RuntimeError("gemm_upload_B failed")
-        if lib.gemm_upload_A(a_ptr, _N) != 0:
-            raise RuntimeError("gemm_upload_A failed")
+    # Build workload backend: run_fn(M) -> (rc, elapsed_ms), flops_fn(M) -> float
+    _resnet_wl = None
+    if workload == "gemm":
+        select_kernel(kernel_name)
+        A = np.ones((_N, _N), dtype=np.float32)
+        B = np.ones((_N, _N), dtype=np.float32)
+        if lib.gemm_init(_N, _N, _N) != 0:
+            raise RuntimeError("gemm_init failed")
+        _ms_buf = ctypes.c_float(0.0)
+        def run_fn(M: int):
+            rc = lib.gemm_run(ctypes.c_int(M), ctypes.byref(_ms_buf))
+            return rc, float(_ms_buf.value)
+        def flops_fn(M: int) -> float:
+            return 2.0 * M * _N * _N
+        workload_label = kernel_name
+    elif workload == "resnet":
+        from resnet_workload import ResNetWorkload
+        _resnet_wl = ResNetWorkload(M_max=M_max)
+        run_fn = _resnet_wl.run
+        flops_fn = _resnet_wl.flops
+        workload_label = f"resnet18 (M_min={M_min}, M_max={M_max})"
+    else:
+        raise ValueError(f"Unknown workload '{workload}'. Choose 'gemm' or 'resnet'.")
 
-        # Calibrate the PDN power model from the kernel workload itself
-        # (runs active GEMM at M_MIN then M_MAX under NVML telemetry).
+    def _destroy_workload():
+        if workload == "gemm":
+            lib.gemm_destroy()
+        elif _resnet_wl is not None:
+            _resnet_wl.destroy()
+
+    try:
+        if workload == "gemm":
+            b_ptr = B.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            a_ptr = A.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            if lib.gemm_upload_B(b_ptr) != 0:
+                raise RuntimeError("gemm_upload_B failed")
+            if lib.gemm_upload_A(a_ptr, _N) != 0:
+                raise RuntimeError("gemm_upload_A failed")
+
+        # Calibrate the PDN power model from the workload itself
+        # (runs workload at M_min then M_max under NVML telemetry).
         calib_total = 2 * (_CALIB_WARMUP_S + _CALIB_SAMPLE_S)
-        print(f"Calibrating PDN from kernel workload "
-              f"({calib_total:.1f} s NVML, kernel={kernel_name})...")
-        calib = _calibrate_pdn_from_nvml()
+        print(f"Calibrating PDN from workload "
+              f"({calib_total:.1f} s NVML, {workload_label})...")
+        calib = _calibrate_pdn_from_nvml(run_fn, M_min, M_max)
         P_idle, P_full, P_idle_std, P_full_std = _validate_calibration(calib)
         print(f"Calibration: source={calib.get('source', 'unknown')}  "
               f"n_samples idle/full = {calib.get('n_samples_idle', 0)}/"
@@ -388,18 +423,18 @@ def run_live(
               f"P_idle={P_idle:.1f}±{P_idle_std:.2f}W  "
               f"P_full={P_full:.1f}±{P_full_std:.2f}W")
 
-        # Closures over the kernel-measured envelope: deterministic DC level load_power(M) + NVML-measured jitter amplitude noise_sigma(M).
-        # Both are linearly interpolated between M_MIN and M_MAX endpoints.
+        # Closures over the measured envelope: deterministic DC level + NVML jitter.
+        # Both are linearly interpolated between M_min and M_max endpoints.
         def load_power(M: int) -> float:
-            if _M_MAX == _M_MIN:
+            if M_max == M_min:
                 return P_idle
-            frac = max(0.0, min(1.0, (M - _M_MIN) / (_M_MAX - _M_MIN)))
+            frac = max(0.0, min(1.0, (M - M_min) / (M_max - M_min)))
             return P_idle + frac * (P_full - P_idle)
 
         def noise_sigma(M: int) -> float:
-            if _M_MAX == _M_MIN:
+            if M_max == M_min:
                 return P_idle_std
-            frac = max(0.0, min(1.0, (M - _M_MIN) / (_M_MAX - _M_MIN)))
+            frac = max(0.0, min(1.0, (M - M_min) / (M_max - M_min)))
             return P_idle_std + frac * (P_full_std - P_idle_std)
 
         # Auto-calibrate V_safe and GROW_STEP from the NVML envelope
@@ -409,18 +444,18 @@ def run_live(
         V_load_min_dc = V_nom - P_full * R
 
         # V_safe = V_min + margin (capped at 50 mV), clamped to stay above
-        # V_min + 3 mV (safety) and below V_load(M_MIN) − 3 mV (achievable).
+        # V_min + 3 mV (safety) and below V_load(M_min) − 3 mV (achievable).
         margin_mv = min(_V_SAFE_MARGIN_MV, _V_SAFE_MARGIN_MV_CAP)
         V_safe_desired = V_min + margin_mv * 1e-3
         V_safe_floor   = V_min + 0.003
         V_safe_ceiling = min(V_load_max_dc - 0.003, V_min + _V_SAFE_MARGIN_MV_CAP * 1e-3)
         if V_safe_ceiling <= V_safe_floor:
             V_safe = max(V_safe_floor, V_load_max_dc - 0.003)
-            print(f"WARNING: DEGENERATE PDN — V_load(M_MIN)={V_load_max_dc:.3f} V "
+            print(f"WARNING: DEGENERATE PDN — V_load(M_min)={V_load_max_dc:.3f} V "
                   f"is at or below V_min+3 mV ({V_min+0.003:.3f} V).  V_min "
                   f"violations are physically UNAVOIDABLE for this "
                   f"(R, P_idle, V_min) triple at any batch size.  V_safe "
-                  f"pinned to {V_safe:.3f} V; controller will drive M -> M_MIN "
+                  f"pinned to {V_safe:.3f} V; controller will drive M -> M_min "
                   f"to minimise the violation rate.  Reduce R, reduce kernel "
                   f"P_idle, or raise V_min to restore a valid operating band.")
         else:
@@ -428,17 +463,21 @@ def run_live(
 
         # Auto-size the grow step so one grow's V_ac overshoot can't dip
         # V_load below V_safe or V_min:
-        #   budget = 0.5 · min(V_load(M_MIN) − V_safe, V_safe − V_min)
+        #   budget = 0.5 · min(V_load(M_min) − V_safe, V_safe − V_min)
         headroom_above_vsafe = max(V_load_max_dc - V_safe, 0.001)
         headroom_vsafe_vmin  = max(V_safe - V_min, 0.001)
         vac_budget           = 0.5 * min(headroom_above_vsafe, headroom_vsafe_vmin)
-        dM_span          = max(1, _M_MAX - _M_MIN)
+        dM_span          = max(1, M_max - M_min)
         slope_v_per_step = (P_full - P_idle) / dM_span * pdn.Z_LC * pdn.overshoot
         if slope_v_per_step > 0:
             grow_step_auto = int(vac_budget / slope_v_per_step)
         else:
             grow_step_auto = _GROW_STEP_DEFAULT
         grow_step = max(1, min(_GROW_STEP_DEFAULT, grow_step_auto))
+
+        # Shrink step: capped to a quarter of the M range so it's sensible
+        # for both wide (GEMM) and narrow (ResNet) M spans.
+        shrink_step = min(_SHRINK_STEP_DEFAULT, max(1, dM_span // 4))
 
         # Effective deadband — clamped so V_shrink stays ≥ V_min + 3 mV.
         requested_db_v = max(0.0, deadband_mv) * 1e-3
@@ -457,10 +496,12 @@ def run_live(
             grow_period_s=grow_period_s,
             V_deadband_v=V_deadband_v,
             grow_step=grow_step,
-            shrink_step=_SHRINK_STEP_DEFAULT,
+            shrink_step=shrink_step,
+            M_min=M_min,
+            M_max=M_max,
             throttle_enabled=throttle_enabled,
         )
-        wstate = WorkerState(M_current=ctrl.M)
+        wstate = WorkerState(M_current=M_min)
 
         # Natural di/dt from one grow step (the controller's own action on
         # the kernel's commanded M is the primary transient source).
@@ -470,7 +511,7 @@ def run_live(
         # Preamble — shows the kernel-measured envelope + derived thresholds.
         mode_banner = ("THROTTLE ENABLED" if throttle_enabled
                        else "UNTHROTTLED BASELINE (controller disabled)")
-        print(f"Active kernel     : {kernel_name}")
+        print(f"Active workload   : {workload_label}")
         print(f"Mode              : {mode_banner}")
         print(f"Data flow         : kernel -> NVML(power) -> PDN(R,L,C) -> V_load -> controller -> M")
         print(f"                  : (every PDN sample and throttle decision is driven by "
@@ -528,7 +569,7 @@ def run_live(
         print(f"Controller        : tick={tick_us:.1f} us  "
               f"grow_period={grow_period_us:.1f} us  "
               f"shrink_period={shrink_period_us:.0f} us")
-        print(f"  step sizes      : shrink=-{_SHRINK_STEP_DEFAULT}  "
+        print(f"  step sizes      : shrink=-{shrink_step}  "
               f"grow=+{grow_step}  "
               f"(V_ac/grow ≤ 0.5·min(head_above_V_safe, V_safe−V_min)="
               f"{min(headroom_above_vsafe, headroom_vsafe_vmin)*1e3:.1f} mV)")
@@ -538,8 +579,8 @@ def run_live(
               f"V_ac={Vac_grow*1e3:.1f} mV overshoot per grow")
         if ramp_up_s > 0:
             print(f"Phase 1 (ramp)    : 0.0–{ramp_up_s:.2f} s  "
-                  f"open-loop M: {_M_MIN}->{_M_MAX} "
-                  f"({(_M_MAX-_M_MIN)/ramp_up_s:.0f} M/s)  "
+                  f"open-loop M: {M_min}->{M_max} "
+                  f"({(M_max-M_min)/ramp_up_s:.0f} M/s)  "
                   f"— controller observes only")
             print(f"Phase 2 (control) : {ramp_up_s:.2f}–{total_seconds:.2f} s  "
                   f"closed-loop PDN-feedback throttling")
@@ -556,7 +597,9 @@ def run_live(
         poller.start()
 
         kernel_thr = threading.Thread(
-            target=_kernel_worker, args=(wstate, stop_ev), daemon=True)
+            target=_kernel_worker,
+            args=(wstate, stop_ev, run_fn, flops_fn, M_min),
+            daemon=True)
         kernel_thr.start()
 
         next_tick   = t0 + tick_s
@@ -571,7 +614,7 @@ def run_live(
 
         t_first_viol: Optional[float] = None
 
-        dM_ramp   = max(1, _M_MAX - _M_MIN)
+        dM_ramp   = max(1, M_max - M_min)
         in_ramp_prev = (ramp_up_s > 0)
 
         # Dedicated PRNG (seed=0) for reproducible NVML-grounded jitter.
@@ -611,8 +654,8 @@ def run_live(
             # Phase 2: closed-loop PDN-feedback control.
             if in_ramp:
                 frac  = min(1.0, t_rel / ramp_up_s) if ramp_up_s > 0 else 1.0
-                M_sched = _M_MIN + int(round(dM_ramp * frac))
-                M_sched = max(_M_MIN, min(_M_MAX, M_sched))
+                M_sched = M_min + int(round(dM_ramp * frac))
+                M_sched = max(M_min, min(M_max, M_sched))
                 if M_sched != ctrl.M:
                     ctrl.M = M_sched
                 # Keep timers fresh so no action is pre-scheduled at ramp end.
@@ -661,7 +704,7 @@ def run_live(
         stop_ev.set()
         if poller:     poller.join(timeout=1.0)
         if kernel_thr: kernel_thr.join(timeout=2.0)
-        lib.gemm_destroy()
+        _destroy_workload()
 
     with wstate.lock:
         total_flops = wstate.total_flops
@@ -680,7 +723,9 @@ def run_live(
         "V_safe":  V_safe,
         "V_shrink_trigger":  ctrl.V_shrink_trigger,
         "V_deadband_mv":  ctrl.V_deadband_v * 1e3,
-        "kernel":  kernel_name,
+        "kernel":  workload_label,
+        "M_min":   M_min,
+        "M_max":   M_max,
         "R":     R,  "L": L,  "C": C,
         "Z_LC":  pdn.Z_LC,
         "zeta":  pdn.zeta,
@@ -697,7 +742,7 @@ def run_live(
         "pdn_noise_scale":  pdn_noise_scale,
         "dP_grow_w":     dP_grow,
         "Vac_grow_v":   Vac_grow,
-        "shrink_step":   _SHRINK_STEP_DEFAULT,
+        "shrink_step":   shrink_step,
         "grow_step":   grow_step,
         "ramp_up_s":   ramp_up_s,
         "V_load_max_dc":  V_load_max_dc,
@@ -824,7 +869,7 @@ def plot_stacked(tl: List[Tick], ev: List[Event],
         ax[0].axvline(ramp_up_s, color="tab:grey", linestyle=":", linewidth=1.0)
         ax[0].text(
             ramp_up_s * 0.5, ax[0].get_ylim()[1],
-            f"open-loop ramp\n0->{_M_MAX} in {ramp_up_s:.1f} s",
+            f"open-loop ramp\n0->{meta.get('M_max', _M_MAX)} in {ramp_up_s:.1f} s",
             ha="center", va="top", fontsize=8, color="dimgrey",
         )
     ax[0].legend(loc="upper left", fontsize=8)
@@ -846,7 +891,7 @@ def plot_stacked(tl: List[Tick], ev: List[Event],
                                 label=f"ramp->control @ {ramp_up_s:.1f} s"))
     ax[1].legend(handles=handles_M, loc="lower right", fontsize=8)
     ax[1].set_ylabel("Batch size M")
-    ax[1].set_ylim(0, _M_MAX * 1.10)
+    ax[1].set_ylim(0, meta.get("M_max", _M_MAX) * 1.10)
     ax[1].grid(True, alpha=0.3)
 
     # Panel 3: V_load with V_safe / V_shrink / V_min reference lines.
@@ -981,7 +1026,7 @@ def plot_compare_M(
 
     ax.set_xlabel("Time [s]")
     ax.set_ylabel("Batch size M")
-    ax.set_ylim(0, _M_MAX * 1.10)
+    ax.set_ylim(0, meta_on.get("M_max", _M_MAX) * 1.10)
     ax.grid(True, alpha=0.3)
     ax.legend(loc="lower right", fontsize=9)
 
@@ -1143,6 +1188,17 @@ def _argparser() -> argparse.ArgumentParser:
                         "emit three comparison plots (M, NVML power, V_load). "
                         "To compare different PDN configurations, invoke "
                         "--compare separately with different --R/--L/--C.")
+    p.add_argument("--out-dir", type=str, default=".",
+                   help="Directory for output CSV and PNG files. Created if it "
+                        "does not exist. Default: current directory.")
+    p.add_argument("--workload", type=str, default="gemm",
+                   choices=["gemm", "resnet"],
+                   help="Workload backend: 'gemm' (default) uses the CUDA GEMM "
+                        "kernel registry; 'resnet' runs ResNet-18 inference.")
+    p.add_argument("--M-min", type=int, default=None,
+                   help="Minimum batch size M (default: 64 for gemm, 1 for resnet).")
+    p.add_argument("--M-max", type=int, default=None,
+                   help="Maximum batch size M (default: 512 for gemm, 16 for resnet).")
     return p
 
 
@@ -1163,6 +1219,12 @@ def main() -> None:
             print(f"  [{idx}] {name}")
         return
 
+    _resnet_defaults = {"M_min": 1, "M_max": 16}
+    _gemm_defaults   = {"M_min": _M_MIN, "M_max": _M_MAX}
+    _wl_defaults = _resnet_defaults if args.workload == "resnet" else _gemm_defaults
+    M_min = args.M_min if args.M_min is not None else _wl_defaults["M_min"]
+    M_max = args.M_max if args.M_max is not None else _wl_defaults["M_max"]
+
     kw = dict(
         V_min=args.V_min, total_seconds=args.total_seconds,
         kernel_name=args.kernel, tick_us=args.tick_us,
@@ -1172,7 +1234,13 @@ def main() -> None:
         ramp_up_s=args.ramp_up_s,
         deadband_mv=args.deadband_mv,
         pdn_noise_scale=args.pdn_noise_scale,
+        workload=args.workload,
+        M_min=M_min,
+        M_max=M_max,
     )
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    pfx = os.path.join(args.out_dir, _OUT_PREFIX)
 
     if args.compare:
         kw_on  = dict(kw); kw_on["throttle_enabled"]  = True
@@ -1180,18 +1248,18 @@ def main() -> None:
 
         print("\n=== RUN 1/2: THROTTLE ENABLED ===")
         tl_on, ev_on, m_on = run_live(R=args.R, L=args.L, C=args.C, **kw_on)
-        write_csv(tl_on, f"{_OUT_PREFIX}_throttle.csv")
+        write_csv(tl_on, f"{pfx}_throttle.csv")
 
         print("\n=== RUN 2/2: UNTHROTTLED BASELINE ===")
         tl_off, ev_off, m_off = run_live(R=args.R, L=args.L, C=args.C, **kw_off)
-        write_csv(tl_off, f"{_OUT_PREFIX}_unthrottled.csv")
+        write_csv(tl_off, f"{pfx}_unthrottled.csv")
 
         plot_compare_M(    tl_on, ev_on, m_on, tl_off, ev_off, m_off,
-                           f"{_OUT_PREFIX}_compare_M.png")
+                           f"{pfx}_compare_M.png")
         plot_compare_power(tl_on, ev_on, m_on, tl_off, ev_off, m_off,
-                           f"{_OUT_PREFIX}_compare_power.png")
+                           f"{pfx}_compare_power.png")
         plot_compare_vload(tl_on, ev_on, m_on, tl_off, ev_off, m_off,
-                           f"{_OUT_PREFIX}_compare_vload.png")
+                           f"{pfx}_compare_vload.png")
 
         s_on  = _summarize(tl_on,  ev_on,  m_on)
         s_off = _summarize(tl_off, ev_off, m_off)
@@ -1206,8 +1274,8 @@ def main() -> None:
 
     # Single run
     tl, ev, meta = run_live(R=args.R, L=args.L, C=args.C, **kw)
-    write_csv(tl, f"{_OUT_PREFIX}.csv")
-    plot_stacked(tl, ev, meta, f"{_OUT_PREFIX}.png")
+    write_csv(tl, f"{pfx}.csv")
+    plot_stacked(tl, ev, meta, f"{pfx}.png")
 
     s = _summarize(tl, ev, meta)
     print()
