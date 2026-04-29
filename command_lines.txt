@@ -44,17 +44,14 @@ python3 controller.py --kernel tiled_gemm --V-min 0.930 --total-seconds 5 --dead
 python3 controller.py --kernel tiled_gemm --V-min 0.930 --total-seconds 5 --deadband-mv 5 --out-dir out/slewguard_gemm
 
 # Run compare mode (throttle ON vs OFF back-to-back)
-python3 controller.py --kernel tiled_gemm --V-min 0.930 --total-seconds 5 --compare --out-dir out/slewguard_gemm
+python3 controller.py --kernel tiled_gemm --V-min 0.930 --total-seconds 5 --deadband-mv 5 --compare --out-dir out/slewguard_gemm
 
 # --- ResNet-18 workload ---
 # Input: random tensor [M, 3, 224, 224] preallocated at init. Sliced to [:M] each run.
 # M is the control knob (batch size). Default range: M_min=1, M_max=16.
 
-# ResNet with custom batch range
-python3 controller.py --workload resnet --M-min 1 --M-max 16 --V-min 0.95 --total-seconds 30 --out-dir out/slewguard_resnet
-
-# ResNet compare mode
-python3 controller.py --workload resnet --V-min 0.95 --total-seconds 30 --compare --out-dir out/slewguard_resnet
+# ResNet with custom batch range and compare mode
+python3 controller.py --workload resnet --M-min 1 --M-max 16 --V-min 0.93 --total-seconds 30 --deadband-mv 5--out-dir out/slewguard_resnet
 
 # To check all available args:
 python3 controller.py --help
